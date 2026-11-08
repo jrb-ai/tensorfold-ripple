@@ -6,6 +6,7 @@
 
 #include "common/qmm_frag.cuh"
 #include "common/fp_pairs.cuh"
+#include "common/act.cuh"
 
 namespace tf_prompt16 {
 
@@ -231,11 +232,28 @@ struct LeanTile {
     static constexpr int SMEM = T::SMEM + 2 * STAGES * 8;  // the stages, then their full and empty barriers
 };
 
+// GU: gate (w, bs, scale) and up (w2, bs2, scale2), both I = N / 2 wide, in one pass. A 256-column tile holds gate's
+// 128 columns (weight tiles 0-1) and up's same 128 (tiles 2-3); warp wn takes gate's n8 tiles 2 wn and 2 wn + 1 and up's
+// same two, so every output's (g, kt) chain is the plain tile's. out [M, I] = swiglu_clamp of the bf16 gate and up.
+enum Epi : int { PLAIN = 0, GU = 1 };
+
+// ricursive.cuh silu_clamp<SILU | LOW> on the plain tile's bf16 gate and up sums: the same operations in the same order.
+__device__ __forceinline__ float swiglu_clamp(float gs, float us, float limit) {
+    const float g0 = __bfloat162float(__float2bfloat16_rn(gs)), u0 = __bfloat162float(__float2bfloat16_rn(us));
+    // a comparison is false for a NaN, so it passes both clamps as torch.clamp keeps it
+    const float g = g0 > limit ? limit : g0;
+    const float hi = u0 > limit ? limit : u0;
+    const float u = u0 < -limit ? -limit : hi;
+    const float silu = __bfloat162float(__float2bfloat16_rn(tf_common::silu_rn(g)));
+    return __fmul_rn(silu, u);
+}
+
 // prompt_kernel's bits on a 128 x 256 tile: same fragments and mma chain over (g, kt); persistent, mbarrier ring
-template <int MODE, int BM, int BN, int WM, int WN, int STAGES, bool F32>
-__global__ void __launch_bounds__(WM * WN * 32, 1) prompt_lean(
+template <int MODE, int BM, int BN, int WM, int WN, int STAGES, bool F32, int EPI>
+__device__ __forceinline__ void lean_tile(
         const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
-        float scale, void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group) {
+        float scale, void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group,
+        const unsigned char* __restrict__ w2, const uint8_t* __restrict__ bs2, float scale2, float limit) {
     using T = Tile<MODE, BM, BN, WM, WN, STAGES>;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -267,14 +285,26 @@ __global__ void __launch_bounds__(WM * WN * 32, 1) prompt_lean(
 #pragma unroll
         for (int i = 0; i < WNC; ++i) {
             const int c = tid + i * T::THREADS, t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
-            wsrc[i] = w + static_cast<size_t>(at.y / 64 + t) * KG * TILE_BYTES + off * 16;
-            win[i] = c < WC && at.y + t * 64 < npad;
+            if constexpr (EPI == GU) {
+                const int col = at.y / 2 + (t & 1) * 64;
+                wsrc[i] = (t < 2 ? w : w2) + static_cast<size_t>(col / 64) * KG * TILE_BYTES + off * 16;
+                win[i] = c < WC && col < npad;
+            } else {
+                wsrc[i] = w + static_cast<size_t>(at.y / 64 + t) * KG * TILE_BYTES + off * 16;
+                win[i] = c < WC && at.y + t * 64 < npad;
+            }
         }
 #pragma unroll
         for (int i = 0; i < SN; ++i) {
             const int c = tid + i * T::THREADS, t = c / (PER / 16), off = c % (PER / 16);
-            ssrc[i] = bs + static_cast<size_t>(at.y / 64 + t) * KG * PER + off * 16;
-            sin[i] = c < SC && at.y + t * 64 < npad;
+            if constexpr (EPI == GU) {
+                const int col = at.y / 2 + (t & 1) * 64;
+                ssrc[i] = (t < 2 ? bs : bs2) + static_cast<size_t>(col / 64) * KG * PER + off * 16;
+                sin[i] = c < SC && col < npad;
+            } else {
+                ssrc[i] = bs + static_cast<size_t>(at.y / 64 + t) * KG * PER + off * 16;
+                sin[i] = c < SC && at.y + t * 64 < npad;
+            }
         }
     };
     uint64_t* full = reinterpret_cast<uint64_t*>(buf + STAGES * T::STAGE);
@@ -336,7 +366,7 @@ __global__ void __launch_bounds__(WM * WN * 32, 1) prompt_lean(
             uint32_t sv[T::NT][4];
 #pragma unroll
             for (int j = 0; j < T::NT; ++j) {
-                const int jj = wn * T::NT + j;
+                const int jj = EPI == GU ? (j >> 1) * 16 + wn * 2 + (j & 1) : wn * T::NT + j;
                 const int col = (jj & 7) * 8 + (lane >> 2);
                 if constexpr (MODE == FP4) {
                     const uint2 u = reinterpret_cast<const uint2*>(pw)[jj * 32 + lane];
@@ -385,6 +415,26 @@ __global__ void __launch_bounds__(WM * WN * 32, 1) prompt_lean(
             if (lane == 0) mbar_arrive(&empty[used % STAGES]);
             if (lt < tiles) load();
         }
+        if constexpr (EPI == GU) {
+            static_assert(MODE == FP4 && BN == 256 && WM == 1 && WN == 8 && !F32, "GU is the 128 x 256 FP4 lean tile");
+            const int I = N / 2;  // the host keeps I a multiple of 128: each tile is whole
+#pragma unroll
+            for (int i = 0; i < T::MT; ++i)
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int col = n0 / 2 + wn * 16 + j * 8 + (lane & 3) * 2;
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int row = m0 + i * 16 + (lane >> 2) + h * 8;
+                        if (row >= M) continue;
+                        const float a0 = swiglu_clamp(acc[i][j][2 * h] * scale, acc[i][j + 2][2 * h] * scale2, limit);
+                        const float a1 = swiglu_clamp(acc[i][j][2 * h + 1] * scale, acc[i][j + 2][2 * h + 1] * scale2, limit);
+                        *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(out) + static_cast<size_t>(row) * I + col) =
+                            __floats2bfloat162_rn(a0, a1);
+                    }
+                }
+            continue;
+        }
 #pragma unroll
         for (int i = 0; i < T::MT; ++i)
 #pragma unroll
@@ -411,6 +461,22 @@ __global__ void __launch_bounds__(WM * WN * 32, 1) prompt_lean(
                 }
             }
     }
+}
+
+template <int MODE, int BM, int BN, int WM, int WN, int STAGES, bool F32>
+__global__ void __launch_bounds__(WM * WN * 32, 1) prompt_lean(
+        const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
+        float scale, void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group) {
+    lean_tile<MODE, BM, BN, WM, WN, STAGES, F32, PLAIN>(x, w, bs, scale, out, M, N, K, npad, ldx, group, nullptr, nullptr,
+                                                        0.0f, 0.0f);
+}
+
+// Gate and up of one FP4 width I in one pass (N = 2 I), out [M, I] their clamped SwiGLU: the lean tile's chains.
+extern "C" __global__ void __launch_bounds__(256, 1) tf_prompt_lean_gu(
+        const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
+        float scale, void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group,
+        const unsigned char* __restrict__ w2, const uint8_t* __restrict__ bs2, float scale2, float limit) {
+    lean_tile<FP4, 128, 256, 1, 8, 3, false, GU>(x, w, bs, scale, out, M, N, K, npad, ldx, group, w2, bs2, scale2, limit);
 }
 
 // The instance the Zig launcher loads by name (PROMPT_TILE 4 in linear.py).

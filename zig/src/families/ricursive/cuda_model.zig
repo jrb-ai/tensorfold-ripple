@@ -370,8 +370,12 @@ pub const Model = struct {
             try glue.gate(&k.glue, s, b.att, b.qkg + (qw + kvw) * 2, n, qw, wq); // G read in place in the q|k|g rows
             try m.linear(b.att, qw, n, l.o, b.y, mode);
             try glue.addNorm(&k.glue, s, .{ .resid = b.resid, .branch = b.y, .post = l.post_attn, .next = l.pre_ffn, .x = b.x, .rows = n, .width = h, .eps = c.eps });
-            try m.mlpIn(l, n, mode);
-            if (n == 1) try glue.siluClamp(&k.glue, s, b.gu, b.act, n, c.intermediate, c.clamp) else try glue.siluClampSplit(&k.glue, s, b.gu, b.up, b.act, n, c.intermediate, c.intermediate, c.clamp);
+            if (mode == .prompt and cuda.nvfp4.Prompt.fusesGateUp(l.gate, l.up)) {
+                try k.prompt.swigluClamp(s, b.x, h, n, l.gate, l.up, b.act, c.clamp); // gate, up and silu_clamp's bits in one pass
+            } else {
+                try m.mlpIn(l, n, mode);
+                if (n == 1) try glue.siluClamp(&k.glue, s, b.gu, b.act, n, c.intermediate, c.clamp) else try glue.siluClampSplit(&k.glue, s, b.gu, b.up, b.act, n, c.intermediate, c.intermediate, c.clamp);
+            }
             try m.linear(b.act, c.intermediate, n, l.down, b.y, mode);
             if (i + 1 < ls.len) {
                 const next = &ls[i + 1];

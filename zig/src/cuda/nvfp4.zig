@@ -71,6 +71,7 @@ pub const Prompt = struct {
     bf16_wide: Function, // one-slice BF16 (SK 1), bf16 out: 128 x 256 on 2 x 4 warps, 2 stages, bf16's bits
     lean: Function, // prompt_lean FP4, bf16 out
     lean_f32: Function, // and fp32 out
+    gu: Function, // tf_prompt_lean_gu: FP4 gate and up of one width in one lean pass, out their clamped SwiGLU
     sms: usize, // the current device's multiprocessors: prompt_lean's blocks (one a multiprocessor, tiles in turn)
 
     pub const Tile = enum { lean, classic };
@@ -140,11 +141,13 @@ pub const Prompt = struct {
         try lean.allowDynamicShared(leanSharedBytes());
         const lean_f32 = try mod.function(lean_symbols[1]);
         try lean_f32.allowDynamicShared(leanSharedBytes());
+        const gu = try mod.function("tf_prompt_lean_gu");
+        try gu.allowDynamicShared(leanSharedBytes());
         var dev: abi.Device = 0;
         try d.check(d.api.cuCtxGetDevice(&dev), "cuCtxGetDevice");
         var sms: c_int = 0;
         try d.check(d.api.cuDeviceGetAttribute(&sms, .multiprocessor_count, dev), "cuDeviceGetAttribute");
-        return .{ .mod = mod, .fp4 = fp4, .fp8 = fp8, .fp4_f32 = fp4_f32, .bf16 = bf16, .bf16_f32 = bf16_f32, .bf16_wide = bf16_wide, .lean = lean, .lean_f32 = lean_f32, .sms = @intCast(@max(sms, 1)) };
+        return .{ .mod = mod, .fp4 = fp4, .fp8 = fp8, .fp4_f32 = fp4_f32, .bf16 = bf16, .bf16_f32 = bf16_f32, .bf16_wide = bf16_wide, .lean = lean, .lean_f32 = lean_f32, .gu = gu, .sms = @intCast(@max(sms, 1)) };
     }
 
     pub fn unload(p: *Prompt) void {
@@ -177,6 +180,41 @@ pub const Prompt = struct {
             else => return error.FormatMismatch,
         };
         return run(s, x, ldx, m, w, y, f, .{ .bm = bm, .bn = bn, .threads = threads, .shared = sharedBytes(w.mode) });
+    }
+
+    /// Whether swigluClamp() takes these weights: FP4 of one shape, a width that whole 128-column tiles cover.
+    pub fn fusesGateUp(gate: qmmf.Weight, up: qmmf.Weight) bool {
+        return gate.mode == .fp4 and up.mode == .fp4 and gate.n == up.n and gate.k == up.k and gate.n % 128 == 0 and gate.k % group == 0;
+    }
+
+    /// a [m, I] bf16 = silu_clamp(bf16(x gate), bf16(x up)) at `limit` (ricursive.cuh's SILU | LOW): matmul()'s gate and
+    /// up bits on the lean tile, one launch, and the activation in its epilogue (I = gate.n; fusesGateUp first).
+    pub fn swigluClamp(p: Prompt, s: Stream, x: u64, ldx: usize, m: usize, gate: qmmf.Weight, up: qmmf.Weight, a: u64, limit: f32) !void {
+        if (!fusesGateUp(gate, up)) return error.UnsupportedShape;
+        const n2 = 2 * gate.n;
+        const rows_t = (m + lean_bm - 1) / lean_bm;
+        const band = @max(1, @min(rows_t, (12 << 20) / (@as(usize, lean_bm) * gate.k * 2)));
+        var args: launch_.Args = .{};
+        args.add(x);
+        args.add(gate.codes);
+        args.add(gate.scales);
+        args.add(gate.scale);
+        args.add(a);
+        args.add(@as(i32, @intCast(m)));
+        args.add(@as(i32, @intCast(n2)));
+        args.add(@as(i32, @intCast(gate.k)));
+        args.add(@as(i32, @intCast(gate.npad)));
+        args.add(@as(i32, @intCast(if (m == 1) gate.k else ldx)));
+        args.add(@as(i32, @intCast(band)));
+        args.add(up.codes);
+        args.add(up.scales);
+        args.add(up.scale);
+        args.add(limit);
+        try launch_.launch(p.gu, .{
+            .grid = .{ .x = @intCast(@min(p.sms, rows_t * (n2 / lean_bn))), .y = 1, .z = 1 },
+            .block = .{ .x = lean_threads, .y = 1, .z = 1 },
+            .shared = leanSharedBytes(),
+        }, s, &args);
     }
 
     const Shape = struct { bm: usize, bn: usize, threads: u32, shared: u32, blocks: usize = std.math.maxInt(usize) };
