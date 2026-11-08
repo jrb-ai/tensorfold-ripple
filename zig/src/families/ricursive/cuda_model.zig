@@ -61,9 +61,8 @@ const Bufs = struct {
     v: u64 = 0, // bf16 [R, kv]
     q: u64 = 0, // bf16 [R, heads, 128]: prep's normed, rotated queries
     att: u64 = 0, // bf16 [R, q]: the attention, then gated in place
-    g: u64 = 0, // bf16 [R, q]: the gate's rows contiguous (several rows)
-    gu: u64 = 0, // bf16 [R, 2I]: gate then up a row, as tf_rc_silu_clamp reads them
-    act: u64 = 0, // bf16 [R, I]: the planar gate, then silu_clamp's output
+    gu: u64 = 0, // bf16 [R, 2I]: one row's gate then up; several rows' planar gate [R, I]
+    act: u64 = 0, // bf16 [R, I]: silu_clamp's output
     up: u64 = 0, // bf16 [R, I]: the planar up
     ids: u64 = 0, // u32 [R]
     pos: u64 = 0, // int32 [round]: a round's rows' positions
@@ -92,7 +91,6 @@ fn bufSizes(c: Config, part: usize, round: usize, per_slot: usize) Bufs {
         .v = r * c.kvWidth() * 2,
         .q = r * q * 2,
         .att = r * q * 2,
-        .g = r * q * 2,
         .gu = r * 2 * f * 2,
         .act = r * f * 2,
         .up = r * f * 2,
@@ -306,12 +304,7 @@ pub const Model = struct {
         return m.k.prompt.matmulOut(m.s, x, ldx, n, w, y, .bf16);
     }
 
-    fn copy2D(m: *const Model, src: u64, src_pitch: usize, dst: u64, dst_pitch: usize, width: usize, height: usize) !void {
-        const p: cuda.abi.Memcpy2D = .{ .src = src, .src_pitch = src_pitch, .dst = dst, .dst_pitch = dst_pitch, .width = width, .height = height };
-        try m.d.check(m.d.api.cuMemcpy2DAsync_v2(&p, m.s.handle), "cuMemcpy2DAsync");
-    }
-
-    /// Gate and up into gu's rows (gate at column 0, up at column I): one row straight in, else planar then copied.
+    /// Gate and up: one row into gu's row (gate at column 0, up at column I), else planar into gu and up.
     fn mlpIn(m: *const Model, l: *const wts.Layer, n: usize, mode: Mode) !void {
         const h = m.c.hidden;
         const f2 = m.c.intermediate * 2;
@@ -320,10 +313,8 @@ pub const Model = struct {
             try m.linear(b.x, h, 1, l.gate, b.gu, mode);
             return m.linear(b.x, h, 1, l.up, b.gu + f2, mode);
         }
-        try m.linear(b.x, h, n, l.gate, b.act, mode);
+        try m.linear(b.x, h, n, l.gate, b.gu, mode); // planar: siluClampSplit reads gate and up rows apart
         try m.linear(b.x, h, n, l.up, b.up, mode);
-        try m.copy2D(b.act, f2, b.gu, 2 * f2, f2, n);
-        try m.copy2D(b.up, f2, b.gu + f2, 2 * f2, f2, n);
     }
 
     /// Layer i's q, k, v prep and attention: a chunk's prep and prompt kernels, or a round's prep_rows and decode.
@@ -376,16 +367,11 @@ pub const Model = struct {
             try m.linear(b.x, h, n, l.qkg, b.qkg, mode);
             try m.linear(b.vx, h, n, l.v, b.v, mode);
             try m.attention(l, i, n, pass);
-            const g_at = b.qkg + (qw + kvw) * 2;
-            const g = if (n == 1) g_at else blk: { // tf_rc_gate reads G rows contiguous
-                try m.copy2D(g_at, wq * 2, b.g, qw * 2, qw * 2, n);
-                break :blk b.g;
-            };
-            try glue.gate(&k.glue, s, b.att, g, n, qw);
+            try glue.gate(&k.glue, s, b.att, b.qkg + (qw + kvw) * 2, n, qw, wq); // G read in place in the q|k|g rows
             try m.linear(b.att, qw, n, l.o, b.y, mode);
             try glue.addNorm(&k.glue, s, .{ .resid = b.resid, .branch = b.y, .post = l.post_attn, .next = l.pre_ffn, .x = b.x, .rows = n, .width = h, .eps = c.eps });
             try m.mlpIn(l, n, mode);
-            try glue.siluClamp(&k.glue, s, b.gu, b.act, n, c.intermediate, c.clamp);
+            if (n == 1) try glue.siluClamp(&k.glue, s, b.gu, b.act, n, c.intermediate, c.clamp) else try glue.siluClampSplit(&k.glue, s, b.gu, b.up, b.act, n, c.intermediate, c.intermediate, c.clamp);
             try m.linear(b.act, c.intermediate, n, l.down, b.y, mode);
             if (i + 1 < ls.len) {
                 const next = &ls[i + 1];

@@ -135,23 +135,24 @@ __device__ __forceinline__ void add_norm(bf16* __restrict__ R, const bf16* __res
   }
 }
 
-// The attention's output gate in place: A = bf16(A bf16(sigmoid(G))), G the bf16 g_proj rows.
+// The attention's output gate in place: A = bf16(A bf16(sigmoid(G))), G the bf16 g_proj rows, `pitch` values apart.
 template <int K>
-__device__ __forceinline__ void gate(bf16* __restrict__ A, const bf16* __restrict__ G, int rows, int width) {
+__device__ __forceinline__ void gate(bf16* __restrict__ A, const bf16* __restrict__ G, int rows, int width, int pitch) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
   if (x >= width || row >= rows) return;
   const size_t i = (size_t)row * width + x;
-  const float s = point<K, SIG>(tf_common::sigmoid_rn(ld(G + i)));
+  const float s = point<K, SIG>(tf_common::sigmoid_rn(ld(G + (size_t)row * pitch + x)));
   A[i] = __float2bfloat16_rn(__fmul_rn(ld(A + i), s));
 }
 
-// The FFN on a stacked gate | up row: gate at most limit, up within +-limit, then bf16(bf16(silu(g)) u).
+// The FFN on gate and up rows, `pitch` values apart: gate at most limit, up within +-limit, then bf16(bf16(silu(g)) u).
 template <int K>
-__device__ __forceinline__ void silu_clamp(const bf16* __restrict__ GU, bf16* __restrict__ A, int rows, int width, float limit) {
+__device__ __forceinline__ void silu_clamp(const bf16* __restrict__ G, const bf16* __restrict__ U, bf16* __restrict__ A,
+                                           int rows, int width, int pitch, float limit) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
   if (x >= width || row >= rows) return;
-  const size_t at = (size_t)row * 2 * width + x;
-  const float g0 = ld(GU + at), u0 = ld(GU + at + width);
+  const size_t at = (size_t)row * pitch + x;
+  const float g0 = ld(G + at), u0 = ld(U + at);
   // a comparison is false for a NaN, so it passes both clamps as torch.clamp keeps it
   const float g = g0 > limit ? limit : g0;
   const float hi = u0 > limit ? limit : u0;

@@ -113,19 +113,22 @@ pub fn addNormBy(f: Function, s: Stream, p: NormRows) !void {
     try go(f, s, .{ .x = @intCast(p.rows) }, &a);
 }
 
-/// The attention's output gate in place: A = bf16(A * bf16(sigmoid(G))) over rows of `width` (query heads x 128).
-pub fn gate(k: *const Kernels, s: Stream, act: u64, g: u64, rows: usize, width: usize) !void {
-    return gateBy(k.gate, s, act, g, rows, width);
+/// The attention's output gate in place: A = bf16(A * bf16(sigmoid(G))) over rows of `width` (query heads x 128), G's
+/// rows `pitch` values apart (width when contiguous, the q|k|g row's width when read in place).
+pub fn gate(k: *const Kernels, s: Stream, act: u64, g: u64, rows: usize, width: usize, pitch: usize) !void {
+    return gateBy(k.gate, s, act, g, rows, width, pitch);
 }
 
 /// `gate` through `f`: the served kernel or a control of it.
-pub fn gateBy(f: Function, s: Stream, act: u64, g: u64, rows: usize, width: usize) !void {
+pub fn gateBy(f: Function, s: Stream, act: u64, g: u64, rows: usize, width: usize, pitch: usize) !void {
     const grid = try plane(rows, width);
+    if (pitch < width) return error.UnsupportedShape;
     var a: cuda.Args = .{};
     a.add(act);
     a.add(g);
     a.add(int(rows));
     a.add(int(width));
+    a.add(int(pitch));
     try go(f, s, grid, &a);
 }
 
@@ -136,12 +139,24 @@ pub fn siluClamp(k: *const Kernels, s: Stream, gu: u64, act: u64, rows: usize, w
 
 /// `siluClamp` through `f`: the served kernel or a control of it.
 pub fn siluClampBy(f: Function, s: Stream, gu: u64, act: u64, rows: usize, width: usize, limit: f32) !void {
+    return siluClampRows(f, s, gu, gu + width * 2, act, rows, width, 2 * width, limit);
+}
+
+/// The same activation from separate gate and up rows, each `pitch` values apart (act's rows `width` apart).
+pub fn siluClampSplit(k: *const Kernels, s: Stream, g: u64, u: u64, act: u64, rows: usize, width: usize, pitch: usize, limit: f32) !void {
+    return siluClampRows(k.silu_clamp, s, g, u, act, rows, width, pitch, limit);
+}
+
+fn siluClampRows(f: Function, s: Stream, g: u64, u: u64, act: u64, rows: usize, width: usize, pitch: usize, limit: f32) !void {
     const grid = try plane(rows, width);
+    if (pitch < width) return error.UnsupportedShape;
     var a: cuda.Args = .{};
-    a.add(gu);
+    a.add(g);
+    a.add(u);
     a.add(act);
     a.add(int(rows));
     a.add(int(width));
+    a.add(int(pitch));
     a.add(limit);
     try go(f, s, grid, &a);
 }

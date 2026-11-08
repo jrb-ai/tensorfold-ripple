@@ -355,7 +355,7 @@ pub const Gate = struct {
 
     pub fn run(self: *Gate, rig: *rig_.Rig) !void {
         try ref.restore(rig, self.dev_a, std.mem.sliceAsBytes(self.act));
-        try kern.gateBy(self.f, rig.s, self.dev_a, self.dev_g, self.shape.rows, self.shape.n);
+        try kern.gateBy(self.f, rig.s, self.dev_a, self.dev_g, self.shape.rows, self.shape.n, self.shape.n);
     }
 
     pub fn count(self: *const Gate) usize {

@@ -21,18 +21,19 @@ namespace tf_rc {
     add_norm<K>(R, Y, w_post, w_next, V0, X, VX, rows, width, eps, blend);                                               \
   }
 
-// Gate: grid (ceil(width / 256), rows), 256 threads, A in place.
+// Gate: grid (ceil(width / 256), rows), 256 threads, A in place; G's rows pitch values apart.
 #define TF_RC_GATE(NAME, K)                                                                                              \
   extern "C" __global__ void __launch_bounds__(NT) NAME(bf16* __restrict__ A, const bf16* __restrict__ G, int rows,     \
-                                                        int width) {                                                     \
-    gate<K>(A, G, rows, width);                                                                                          \
+                                                        int width, int pitch) {                                          \
+    gate<K>(A, G, rows, width, pitch);                                                                                   \
   }
 
-// SiLU-clamp: grid (ceil(width / 256), rows), 256 threads; GU rows are 2 x width (gate | up).
+// SiLU-clamp: grid (ceil(width / 256), rows), 256 threads; G's and U's rows pitch values apart (A's width apart).
 #define TF_RC_SILU_CLAMP(NAME, K)                                                                                        \
-  extern "C" __global__ void __launch_bounds__(NT) NAME(const bf16* __restrict__ GU, bf16* __restrict__ A, int rows,    \
-                                                        int width, float limit) {                                        \
-    silu_clamp<K>(GU, A, rows, width, limit);                                                                            \
+  extern "C" __global__ void __launch_bounds__(NT) NAME(const bf16* __restrict__ G, const bf16* __restrict__ U,         \
+                                                        bf16* __restrict__ A, int rows, int width, int pitch,          \
+                                                        float limit) {                                                   \
+    silu_clamp<K>(G, U, A, rows, width, pitch, limit);                                                                   \
   }
 
 // tap's planted faults, a bit each (the served kernel has none).
