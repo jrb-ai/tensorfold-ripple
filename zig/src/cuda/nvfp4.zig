@@ -68,6 +68,7 @@ pub const Prompt = struct {
     fp4_f32: Function, // FP4 writing the fp32 sums unrounded
     bf16: Function, // BF16 on 2 x 4 warps, 3 stages, the lane's K slices (bf16Shared): the lane's bits
     bf16_f32: Function,
+    bf16_wide: Function, // one-slice BF16 (SK 1), bf16 out: 128 x 256 on 2 x 4 warps, 2 stages, bf16's bits
     lean: Function, // prompt_lean FP4, bf16 out
     lean_f32: Function, // and fp32 out
     sms: usize, // the current device's multiprocessors: prompt_lean's blocks (one a multiprocessor, tiles in turn)
@@ -89,6 +90,13 @@ pub const Prompt = struct {
     /// prompt16.cu Tile<BF16, 128, 128, 2, 4, 3>::SMEM: x and the bf16 words of 64 inputs, three stages.
     pub fn bf16Shared() u32 {
         return 3 * ((bm * group * 2 + bn * group * 2 + 127) / 128 * 128);
+    }
+
+    const wide_bn = 256;
+
+    /// prompt16.cu Tile<BF16, 128, 256, 2, 4, 2>::SMEM: tf_prompt_bf16_wide's two stages.
+    pub fn bf16WideShared() u32 {
+        return 2 * ((bm * group * 2 + wide_bn * group * 2 + 127) / 128 * 128);
     }
 
     const lean_bm = 128;
@@ -126,6 +134,8 @@ pub const Prompt = struct {
         try bf16.allowDynamicShared(bf16Shared());
         const bf16_f32 = try mod.function("tf_prompt_bf16_f32");
         try bf16_f32.allowDynamicShared(bf16Shared());
+        const bf16_wide = try mod.function("tf_prompt_bf16_wide");
+        try bf16_wide.allowDynamicShared(bf16WideShared());
         const lean = try mod.function(lean_symbols[0]);
         try lean.allowDynamicShared(leanSharedBytes());
         const lean_f32 = try mod.function(lean_symbols[1]);
@@ -134,7 +144,7 @@ pub const Prompt = struct {
         try d.check(d.api.cuCtxGetDevice(&dev), "cuCtxGetDevice");
         var sms: c_int = 0;
         try d.check(d.api.cuDeviceGetAttribute(&sms, .multiprocessor_count, dev), "cuDeviceGetAttribute");
-        return .{ .mod = mod, .fp4 = fp4, .fp8 = fp8, .fp4_f32 = fp4_f32, .bf16 = bf16, .bf16_f32 = bf16_f32, .lean = lean, .lean_f32 = lean_f32, .sms = @intCast(@max(sms, 1)) };
+        return .{ .mod = mod, .fp4 = fp4, .fp8 = fp8, .fp4_f32 = fp4_f32, .bf16 = bf16, .bf16_f32 = bf16_f32, .bf16_wide = bf16_wide, .lean = lean, .lean_f32 = lean_f32, .sms = @intCast(@max(sms, 1)) };
     }
 
     pub fn unload(p: *Prompt) void {
@@ -194,9 +204,13 @@ pub const Prompt = struct {
     }
 
     /// A BF16 weight in the lane's word order: the lane's K slices (qmmf.slices, pinned ones too), folded in order.
+    /// One-slice weights with bf16 out take tf_prompt_bf16_wide when its 128 x 256 tiles give each multiprocessor four.
     fn matmulBf16(p: Prompt, s: Stream, x: u64, ldx: usize, m: usize, w: qmmf.Weight, y: u64, out: qmmf.Out) !void {
         const rows_t = (m + bm - 1) / bm;
         const band = @max(1, @min(rows_t, (12 << 20) / (@as(usize, bm) * w.k * 2)));
+        const sk = qmmf.slices(w);
+        const wide = sk == 1 and out == .bf16 and rows_t * ((w.n + wide_bn - 1) / wide_bn) >= 4 * p.sms;
+        const tn: usize = if (wide) wide_bn else bn;
         var args: launch_.Args = .{};
         args.add(x);
         args.add(w.codes);
@@ -205,20 +219,21 @@ pub const Prompt = struct {
         args.add(@as(i32, @intCast(m)));
         args.add(@as(i32, @intCast(w.n)));
         args.add(@as(i32, @intCast(w.k)));
-        args.add(@as(i32, @intCast(qmmf.slices(w))));
+        args.add(@as(i32, @intCast(sk)));
         args.add(@as(i32, @intCast(w.npad)));
         args.add(@as(i32, @intCast(if (m == 1) w.k else ldx)));
         args.add(@as(i32, @intCast(band)));
-        try launch_.launch(if (out == .f32) p.bf16_f32 else p.bf16, .{
-            .grid = .{ .x = @intCast(rows_t * ((w.n + bn - 1) / bn)), .y = 1, .z = 1 },
+        try launch_.launch(if (wide) p.bf16_wide else if (out == .f32) p.bf16_f32 else p.bf16, .{
+            .grid = .{ .x = @intCast(rows_t * ((w.n + tn - 1) / tn)), .y = 1, .z = 1 },
             .block = .{ .x = bf16_threads, .y = 1, .z = 1 },
-            .shared = bf16Shared(),
+            .shared = if (wide) bf16WideShared() else bf16Shared(),
         }, s, &args);
     }
 };
 
 test "the prompt tile's shared bytes and instance names" {
     try std.testing.expectEqual(@as(u32, 41984), Prompt.sharedBytes(.fp4));
+    try std.testing.expectEqual(@as(u32, 98304), Prompt.bf16WideShared()); // 2 x (16384 + 32768)
     try std.testing.expectEqual(@as(u32, 76848), Prompt.leanSharedBytes()); // 3 x (16384 + 8192 + 1024) + 48
     try std.testing.expectEqualStrings("_ZN11tf_prompt1611prompt_leanILi0ELi128ELi256ELi1ELi8ELi3ELb0EEEvPK13__nv_bfloat16PKhS5_fPviiiiii", Prompt.lean_symbols[0]);
     try std.testing.expectEqual(@as(u32, 49152), Prompt.sharedBytes(.fp8)); // 2 x (16384 + 8192): no scale tile

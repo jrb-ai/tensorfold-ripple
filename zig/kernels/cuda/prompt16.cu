@@ -428,16 +428,18 @@ template __global__ void prompt_lean<FP4, 128, 256, 1, 8, 3, true>(
     void* __restrict__, int, int, int, int, int, int);
 
 // BF16 prompt rows on qmmf's BF16 words with qmmf_kernel's sums (K slices from zero, added in order): the lane's bits.
-template <bool F32>
+// SL false drops the slice sums for one-slice weights (SK 1 only): with no second accumulator a 128 x 256 tile fits.
+template <bool F32, int BN = 128, int STAGES = 3, bool SL = true>
 __device__ __forceinline__ void prompt_bf16(const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w,
                                             float scale, void* __restrict__ out, int M, int N, int K, int SK, int npad,
                                             int ldx, int group) {
-    constexpr int BM = 128, BN = 128, WM = 2, WN = 4, STAGES = 3;
+    constexpr int BM = 128, WM = 2, WN = 4;
     using T = Tile<BF16, BM, BN, WM, WN, STAGES>;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / WN, wn = warp % WN;
-    const int KG = K / GS, slice_groups = KG / SK;
+    const int KG = K / GS;
+    [[maybe_unused]] const int slice_groups = KG / SK;
     const int2 at = tile_of(blockIdx.x, M, N, BM, BN, group);
     const int m0 = at.x, n0 = at.y;
 
@@ -459,29 +461,34 @@ __device__ __forceinline__ void prompt_bf16(const __nv_bfloat16* __restrict__ x,
     };
 
     float acc[T::MT][T::NT][4];
-    float tot[T::MT][T::NT][4];
+    float tot[SL ? T::MT : 1][SL ? T::NT : 1][4];
 #pragma unroll
     for (int i = 0; i < T::MT; ++i)
 #pragma unroll
         for (int j = 0; j < T::NT; ++j)
 #pragma unroll
-            for (int e = 0; e < 4; ++e) acc[i][j][e] = tot[i][j][e] = 0.0f;
+            for (int e = 0; e < 4; ++e) {
+                acc[i][j][e] = 0.0f;
+                if constexpr (SL) tot[i][j][e] = 0.0f;
+            }
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < KG) load(s, s);
         commit();
     }
     for (int g = 0; g < KG; ++g) {
-        if (SK > 1 && g > 0 && g % slice_groups == 0) {
+        if constexpr (SL) {
+            if (SK > 1 && g > 0 && g % slice_groups == 0) {
 #pragma unroll
-            for (int i = 0; i < T::MT; ++i)
+                for (int i = 0; i < T::MT; ++i)
 #pragma unroll
-                for (int j = 0; j < T::NT; ++j)
+                    for (int j = 0; j < T::NT; ++j)
 #pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        tot[i][j][e] = g == slice_groups ? acc[i][j][e] : tot[i][j][e] + acc[i][j][e];
-                        acc[i][j][e] = 0.0f;
-                    }
+                        for (int e = 0; e < 4; ++e) {
+                            tot[i][j][e] = g == slice_groups ? acc[i][j][e] : tot[i][j][e] + acc[i][j][e];
+                            acc[i][j][e] = 0.0f;
+                        }
+            }
         }
         wait<STAGES - 2>();
         __syncthreads();
@@ -508,13 +515,15 @@ __device__ __forceinline__ void prompt_bf16(const __nv_bfloat16* __restrict__ x,
         }
     }
     wait<0>();
-    if (SK > 1) {
+    if constexpr (SL) {
+        if (SK > 1) {
 #pragma unroll
-        for (int i = 0; i < T::MT; ++i)
+            for (int i = 0; i < T::MT; ++i)
 #pragma unroll
-            for (int j = 0; j < T::NT; ++j)
+                for (int j = 0; j < T::NT; ++j)
 #pragma unroll
-                for (int e = 0; e < 4; ++e) acc[i][j][e] = tot[i][j][e] + acc[i][j][e];
+                    for (int e = 0; e < 4; ++e) acc[i][j][e] = tot[i][j][e] + acc[i][j][e];
+        }
     }
 #pragma unroll
     for (int i = 0; i < T::MT; ++i)
@@ -553,6 +562,14 @@ extern "C" __global__ void __launch_bounds__(256) tf_prompt_bf16_f32(const __nv_
                                                                      float scale, void* __restrict__ out, int M, int N, int K, int SK,
                                                                      int npad, int ldx, int group) {
     prompt_bf16<true>(x, w, scale, out, M, N, K, SK, npad, ldx, group);
+}
+
+// One-slice BF16 weights (SK 1), bf16 out: a 128 x 256 tile, two stages, the same (g, kt) chain from zero: the same bits.
+extern "C" __global__ void __launch_bounds__(256, 1) tf_prompt_bf16_wide(const __nv_bfloat16* __restrict__ x,
+                                                                         const unsigned char* __restrict__ w, float scale,
+                                                                         void* __restrict__ out, int M, int N, int K,
+                                                                         int SK, int npad, int ldx, int group) {
+    prompt_bf16<false, 256, 2, false>(x, w, scale, out, M, N, K, SK, npad, ldx, group);
 }
 }
 
