@@ -8,6 +8,10 @@ pub const cuda = [_]registry.CudaRecord{
     .{ .launch = .{ .name = "window attention wattn_kernel<128, 8, 2, 8>", .symbol = "_ZN16tf_window_prompt12wattn_kernelILi128ELi8ELi2ELi8EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifii", .image = "window_attention", .threads = 256, .dynamic = 65536, .opt_in = true }, .usage = .{ .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 } } },
     // TODO(spark): fill from kernel-contract-limits
     .{ .launch = .{ .name = "window attention tf_window_prompt_h2_pg", .symbol = "tf_window_prompt_h2_pg", .image = "window_attention", .threads = 256, .dynamic = 65536, .opt_in = true }, .usage = .{ .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 } } },
+    // TODO(spark): fill from kernel-contract-limits
+    .{ .launch = .{ .name = "window attention tf_window_prompt_h2_mb", .symbol = "tf_window_prompt_h2_mb", .image = "window_attention", .threads = 256, .dynamic = 82000, .opt_in = true }, .usage = .{ .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 } } },
+    // TODO(spark): fill from kernel-contract-limits
+    .{ .launch = .{ .name = "window attention tf_window_prompt_h2_mb_pg", .symbol = "tf_window_prompt_h2_mb_pg", .image = "window_attention", .threads = 256, .dynamic = 82000, .opt_in = true }, .usage = .{ .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 }, .{ .regs = 0, .static = 0, .bound = 0 } } },
 };
 
 test "Ripple's prompt attention: unmeasured records cannot pass a compiled resource check" {

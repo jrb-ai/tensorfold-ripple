@@ -13,12 +13,13 @@ pub const heads_a_block = 2;
 /// Eight warps, each 16 rows of one head: 64 rows a block.
 pub const rows_a_block = 16 * (8 / heads_a_block);
 
-/// wattn_kernel<128, 8, 2, 8>: keys in a ring (sliding layers) or linear (global layers).
-pub const prompt_symbol = "_ZN16tf_window_prompt12wattn_kernelILi128ELi8ELi2ELi8EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifii";
-/// The same over a stream's pages (global layers only: no window).
-pub const prompt_pg_symbol = "tf_window_prompt_h2_pg";
-/// window_attention.zig's prompt_smem: eight staging slots of 32 keys at head dim 128.
-const prompt_smem: u32 = 8 * 32 * 16 * 16;
+/// wattn_kernel<128, 8, 2, 8>'s bits through an mbarrier ring (no block barrier in the key loop): keys in a ring
+/// (sliding layers) or linear (global layers).
+pub const prompt_symbol = "tf_window_prompt_h2_mb";
+/// The same over a stream's pages (global layers only: no window): tf_window_prompt_h2_pg's bits.
+pub const prompt_pg_symbol = "tf_window_prompt_h2_mb_pg";
+/// Five staging slots of 64 keys at head dim 128, then a full and an empty barrier (8 bytes each) a slot.
+pub const prompt_smem: u32 = 5 * 64 * 16 * 16 + 2 * 5 * 8;
 
 pub const Kernels = struct {
     prompt: Function,
@@ -58,7 +59,7 @@ pub fn check(w: wa.Window, p0: usize, n: usize) error{WindowShape}!void {
     if (!ringHolds(w, p0, n)) return error.WindowShape;
 }
 
-/// The launch: (rows / 64) x (key heads x head pairs) blocks of 256 threads, 64 KiB of staged keys.
+/// The launch: (rows / 64) x (key heads x head pairs) blocks of 256 threads, 80 KiB of staged keys and the barriers.
 pub fn config(w: wa.Window, n: usize) cuda.Config {
     const pairs = w.h / w.hk / heads_a_block;
     return .{ .grid = .{ .x = @intCast((n + rows_a_block - 1) / rows_a_block), .y = @intCast(w.hk * pairs), .z = 1 }, .block = .{ .x = 256 }, .shared = prompt_smem };
@@ -269,7 +270,7 @@ test "Ripple's prompt grid: 64 rows a block, five head pairs of each of 8 key he
         try t.expectEqual(c[1], @as(u32, cfg.grid.x));
         try t.expectEqual(@as(u32, 40), @as(u32, cfg.grid.y));
         try t.expectEqual(@as(u32, 256), @as(u32, cfg.block.x));
-        try t.expectEqual(@as(u32, 65536), cfg.shared);
+        try t.expectEqual(@as(u32, 82000), cfg.shared);
     }
 }
 

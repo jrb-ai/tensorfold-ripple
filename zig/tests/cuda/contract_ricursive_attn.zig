@@ -44,9 +44,9 @@ fn globalCfg(name: []const u8, pages: usize, served: []const c.Shape) wk.Cfg {
 }
 
 pub const prompts = [_]Cfg{
-    .{ .base = slidingCfg("cuda ricursive prompt wattn_kernel<128, 8, 2, 8>, 80/8 heads, window 1024, ring 3072", &sliding_served) },
-    .{ .base = globalCfg("cuda ricursive prompt wattn_kernel<128, 8, 2, 8>, 80/8 heads, every key (global layers)", 0, &global_served) },
-    .{ .base = globalCfg("cuda ricursive prompt tf_window_prompt_h2_pg, 80/8 heads, every key, pages of 512", page, &global_served) },
+    .{ .base = slidingCfg("cuda ricursive prompt tf_window_prompt_h2_mb, 80/8 heads, window 1024, ring 3072", &sliding_served) },
+    .{ .base = globalCfg("cuda ricursive prompt tf_window_prompt_h2_mb, 80/8 heads, every key (global layers)", 0, &global_served) },
+    .{ .base = globalCfg("cuda ricursive prompt tf_window_prompt_h2_mb_pg, 80/8 heads, every key, pages of 512", page, &global_served) },
     // a row's bits do not depend on its chunk: cuts of the same rows bit-equal to one call
     .{ .base = slidingCfg("cuda ricursive prompt in chunks of 1,000, window 1024: one call's bits", &sliding_served), .chunk = 1000 },
     .{ .base = slidingCfg("cuda ricursive prompt in chunks of 333, window 1024: one call's bits", &sliding_served), .chunk = 333 },
